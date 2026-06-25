@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Antipode — see through the ground</title>
+<style>
+  :root {
+    --ink: #e8ecf2;
+    --dim: #7a8699;
+    --mantle: #ff7a3d;
+    --core: #ffd166;
+    --bg: #05070d;
+    --line: rgba(122,134,153,0.25);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: var(--bg); }
+  body {
+    font-family: ui-monospace, "SF Mono", "Roboto Mono", Menlo, monospace;
+    color: var(--ink);
+    -webkit-user-select: none; user-select: none;
+    touch-action: none;
+  }
+  #scene { position: fixed; inset: 0; }
+
+  .hud { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
+  .corner {
+    position: absolute; font-size: 11px; letter-spacing: 0.08em;
+    color: var(--dim); text-transform: uppercase;
+  }
+  .tl { top: 16px; left: 16px; }
+  .tr { top: 16px; right: 16px; text-align: right; }
+  .bl { bottom: 16px; left: 16px; }
+  .br { bottom: 16px; right: 16px; text-align: right; }
+  .val { color: var(--ink); font-size: 13px; letter-spacing: 0; }
+  .accent { color: var(--mantle); }
+
+  .reticle {
+    position: fixed; top: 50%; left: 50%;
+    width: 54px; height: 54px; margin: -27px 0 0 -27px;
+    border: 1px solid var(--line); border-radius: 50%;
+    z-index: 9; pointer-events: none;
+  }
+  .reticle::before, .reticle::after { content: ""; position: absolute; background: var(--line); }
+  .reticle::before { left: 50%; top: -10px; bottom: -10px; width: 1px; margin-left: -0.5px; }
+  .reticle::after { top: 50%; left: -10px; right: -10px; height: 1px; margin-top: -0.5px; }
+
+  .gate {
+    position: fixed; inset: 0; z-index: 50;
+    background: radial-gradient(120% 80% at 50% 30%, #0b1020 0%, #05070d 70%);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 32px; text-align: center;
+  }
+  .gate h1 { font-size: 13px; font-weight: 400; letter-spacing: 0.35em; text-transform: uppercase; color: var(--mantle); margin-bottom: 28px; }
+  .gate p { font-size: 14px; line-height: 1.7; color: var(--dim); max-width: 30ch; margin-bottom: 8px; }
+  .gate .lede { color: var(--ink); font-size: 18px; line-height: 1.5; max-width: 22ch; margin-bottom: 24px; }
+  .btn {
+    pointer-events: auto; margin-top: 28px;
+    background: none; border: 1px solid var(--mantle); color: var(--mantle);
+    font-family: inherit; font-size: 13px; letter-spacing: 0.15em; text-transform: uppercase;
+    padding: 16px 32px; border-radius: 2px; cursor: pointer; transition: background 0.2s, color 0.2s;
+  }
+  .btn:active { background: var(--mantle); color: var(--bg); }
+  .hide { display: none !important; }
+  .err { color: var(--mantle); font-size: 12px; margin-top: 20px; min-height: 16px; max-width: 32ch; }
+  .spin { color: var(--dim); font-size: 12px; margin-top: 20px; letter-spacing: 0.2em; }
+
+  #log {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 100;
+    max-height: 38vh; overflow-y: auto; pointer-events: auto;
+    background: rgba(3,5,10,0.92); border-top: 1px solid var(--line);
+    font-size: 11px; line-height: 1.5; padding: 8px 10px 10px;
+    color: var(--dim); white-space: pre-wrap; word-break: break-word;
+  }
+  #log .e { color: var(--mantle); }
+  #log .w { color: var(--core); }
+  #logbar {
+    position: fixed; right: 10px; bottom: 10px; z-index: 101; pointer-events: auto;
+    background: rgba(3,5,10,0.9); border: 1px solid var(--line); color: var(--dim);
+    font-family: inherit; font-size: 11px; padding: 6px 10px; border-radius: 2px; cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+
+<div class="reticle hide" id="reticle"></div>
+
+<div class="hud hide" id="hud">
+  <div class="corner tl"><div>your position</div><div class="val" id="here">—</div></div>
+  <div class="corner tr"><div>looking at</div><div class="val accent" id="target">—</div></div>
+  <div class="corner bl"><div>heading · pitch</div><div class="val" id="orient">—</div></div>
+  <div class="corner br"><div>depth</div><div class="val" id="depth">surface</div></div>
+</div>
+
+<div class="gate" id="gate">
+  <h1>Antipode</h1>
+  <p class="lede">Point your phone at the ground. See what's on the other side of the planet.</p>
+  <p>This prototype reads your location and your phone's motion sensors, then casts your gaze straight through the Earth.</p>
+  <button class="btn" id="start">Begin</button>
+  <div class="err" id="err"></div>
+  <div class="spin hide" id="spin">acquiring signal…</div>
+</div>
+
+<button id="logbar">console &#9662;</button>
+<div id="log" class="hide"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+/* ---------------- on-screen console ---------------- */
+(function () {
+  const box = document.getElementById('log');
+  const bar = document.getElementById('logbar');
+  let open = false;
+  bar.addEventListener('click', () => {
+    open = !open;
+    box.classList.toggle('hide', !open);
+    bar.innerHTML = open ? 'console &#9652;' : 'console &#9662;';
+  });
+  function write(cls, args) {
+    const line = document.createElement('div');
+    if (cls) line.className = cls;
+    line.textContent = args.map(a =>
+      typeof a === 'object' ? (a && a.message ? a.message : JSON.stringify(a)) : String(a)
+    ).join(' ');
+    box.appendChild(line);
+    box.scrollTop = box.scrollHeight;
+    if (cls === 'e' && !open) bar.click();
+  }
+  const orig = { log: console.log, warn: console.warn, error: console.error };
+  console.log   = function () { orig.log.apply(console, arguments);   write('',  [].slice.call(arguments)); };
+  console.warn  = function () { orig.warn.apply(console, arguments);  write('w', [].slice.call(arguments)); };
+  console.error = function () { orig.error.apply(console, arguments); write('e', [].slice.call(arguments)); };
+  window.addEventListener('error', e =>
+    write('e', ['Uncaught:', e.message, 'at', (e.filename||'') + ':' + (e.lineno||'?')]));
+  window.addEventListener('unhandledrejection', e =>
+    write('e', ['Promise rejected:', (e.reason && e.reason.message) || e.reason]));
+  console.log('console ready');
+})();
+
+/* ---------------- guard: did Three.js load? ---------------- */
+if (typeof THREE === 'undefined') {
+  console.error('THREE failed to load - the CDN script was blocked. The 3D view cannot run here.');
+}
+
+const $ = id => document.getElementById(id);
+const D2R = Math.PI / 180, R2D = 180 / Math.PI;
+
+let userLat = 0, userLon = 0, haveLoc = false;
+let renderer, scene, camera, globe, boundaries;
+const R = 1;
+
+let oAlpha = 0, oBeta = 0, oGamma = 0;
+let screenAngle = 0;
+let gotOrientation = false;
+let dragMode = false;
+let dragYaw = 0, dragPitch = -1.2;
+
+$('start').addEventListener('click', () => { begin().catch(showFatal); });
+
+function showFatal(e) {
+  console.error('startup failed:', e);
+  $('spin').classList.add('hide');
+  $('err').textContent = 'Could not start: ' + (e && e.message ? e.message : e);
+}
+
+async function begin() {
+  $('err').textContent = '';
+  $('spin').classList.remove('hide');
+  console.log('begin: requesting location...');
+
+  if (typeof THREE === 'undefined')
+    throw new Error('3D library unavailable (CDN blocked)');
+
+  try {
+    const pos = await new Promise((res, rej) => {
+      if (!navigator.geolocation) return rej(new Error('no geolocation API'));
+      navigator.geolocation.getCurrentPosition(res, rej, { enableHighAccuracy: true, timeout: 8000 });
+    });
+    userLat = pos.coords.latitude; userLon = pos.coords.longitude; haveLoc = true;
+    console.log('location ok:', userLat.toFixed(3), userLon.toFixed(3));
+  } catch (e) {
+    userLat = 22.0599209; userLon = -159.3178611; haveLoc = false;
+    console.warn('location unavailable (' + (e.message||e) + ') - using preset coordinates');
+    $('err').textContent = 'Location unavailable - using preset coordinates.';
+  }
+
+  // Diagnostics: figure out WHY sensors might not be available.
+  console.log('secureContext:', window.isSecureContext);
+  console.log('in iframe:', window.self !== window.top);
+  console.log('DeviceOrientationEvent present:', typeof DeviceOrientationEvent !== 'undefined');
+
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' &&
+        typeof DeviceOrientationEvent.requestPermission === 'function') {
+      console.log('requesting iOS motion permission...');
+      const r = await DeviceOrientationEvent.requestPermission();
+      console.log('motion permission:', r);
+      if (r !== 'granted') throw new Error('motion permission ' + r);
+    } else {
+      console.log('no requestPermission() - Android/desktop path, listeners attached directly');
+    }
+    // Listen for BOTH event types. Android Chrome often only fires the
+    // 'absolute' variant; iOS fires the plain one.
+    window.addEventListener('deviceorientation', onOrient, true);
+    window.addEventListener('deviceorientationabsolute', onOrient, true);
+
+    // Raw probe: log the very first event of EITHER type, whatever its values,
+    // so we can tell "no events at all" (iframe blocked) from "events with null
+    // values" (sensor present but unreferenced).
+    const probe = (tag) => (e) => {
+      console.log('raw ' + tag + ': a=' + e.alpha + ' b=' + e.beta + ' g=' + e.gamma +
+                  ' abs=' + e.absolute);
+      window.removeEventListener('deviceorientation', probeA, true);
+      window.removeEventListener('deviceorientationabsolute', probeB, true);
+    };
+    const probeA = probe('deviceorientation');
+    const probeB = probe('deviceorientationabsolute');
+    window.addEventListener('deviceorientation', probeA, true);
+    window.addEventListener('deviceorientationabsolute', probeB, true);
+  } catch (e) {
+    console.warn('motion blocked (' + (e.message||e) + ') - drag to look');
+    enableDragFallback();
+  }
+
+  setTimeout(() => {
+    if (!gotOrientation && !dragMode) {
+      console.warn('no sensor data after 2.5s - switching to drag mode');
+      console.warn('likely cause: this iframe was not granted gyroscope/accelerometer ' +
+                   'permission by the host page. Open the file directly in your browser ' +
+                   '(not embedded) over https to use real sensors.');
+      enableDragFallback();
+    }
+  }, 2500);
+
+  if (screen.orientation) {
+    screenAngle = (screen.orientation.angle || 0) * D2R;
+    screen.orientation.addEventListener('change', () =>
+      screenAngle = (screen.orientation.angle || 0) * D2R);
+  }
+
+  initScene();
+  console.log('scene initialised');
+  $('gate').classList.add('hide');
+  $('hud').classList.remove('hide');
+  $('reticle').classList.remove('hide');
+  $('here').textContent = fmt(userLat, userLon);
+  loop();
+  console.log('render loop running');
+}
+
+function onOrient(e) {
+  if (e.alpha == null && e.beta == null && e.gamma == null) return;
+  if (!gotOrientation) { gotOrientation = true; console.log('first orientation event received'); }
+  oAlpha = (e.alpha||0) * D2R; oBeta = (e.beta||0) * D2R; oGamma = (e.gamma||0) * D2R;
+}
+
+function antipode(lat, lon) { return { lat: -lat, lon: lon > 0 ? lon - 180 : lon + 180 }; }
+function fmt(lat, lon) {
+  const ns = lat >= 0 ? 'N' : 'S', ew = lon >= 0 ? 'E' : 'W';
+  return Math.abs(lat).toFixed(2) + '\u00b0' + ns + ' ' + Math.abs(lon).toFixed(2) + '\u00b0' + ew;
+}
+function llToVec(lat, lon, r) {
+  r = r || 1;
+  const phi = (90 - lat) * D2R, theta = (lon + 180) * D2R;
+  return new THREE.Vector3(
+    -r * Math.sin(phi) * Math.cos(theta),
+     r * Math.cos(phi),
+     r * Math.sin(phi) * Math.sin(theta)
+  );
+}
+
+function initScene() {
+  renderer = new THREE.WebGLRenderer({ canvas: $('scene'), antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+
+  scene = new THREE.Scene();
+  scene.fog = new THREE.FogExp2(0x05070d, 0.42);
+  camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.01, 100);
+
+  globe = new THREE.Group();
+  scene.add(globe);
+
+  // Earth body as a translucent shell. Render only the FAR (back) faces and
+  // skip depth-writing, so the near hemisphere never occludes the far-side
+  // boundary lines we want to "see through the ground" toward. The fog then
+  // dims geography by how deep through the planet it sits.
+  globe.add(new THREE.Mesh(
+    new THREE.SphereGeometry(R * 0.985, 64, 48),
+    new THREE.MeshBasicMaterial({
+      color: 0x0a1424, transparent: true, opacity: 0.22,
+      side: THREE.BackSide, depthWrite: false
+    })
+  ));
+  // molten core glow, also non-occluding
+  globe.add(new THREE.Mesh(
+    new THREE.SphereGeometry(R * 0.5, 32, 24),
+    new THREE.MeshBasicMaterial({
+      color: 0xff7a3d, transparent: true, opacity: 0.18,
+      side: THREE.BackSide, depthWrite: false
+    })
+  ));
+  // faint atmospheric halo
+  globe.add(new THREE.Mesh(
+    new THREE.SphereGeometry(R * 1.06, 48, 32),
+    new THREE.MeshBasicMaterial({
+      color: 0x2a3f63, transparent: true, opacity: 0.08,
+      side: THREE.BackSide, depthWrite: false
+    })
+  ));
+
+  boundaries = new THREE.Group();
+  globe.add(boundaries);
+  buildGraticule(boundaries);
+  loadCountries(boundaries);
+
+  const a = antipode(userLat, userLon);
+  const mk = new THREE.Mesh(
+    new THREE.SphereGeometry(0.012, 16, 16),
+    new THREE.MeshBasicMaterial({ color: 0xffd166 })
+  );
+  mk.position.copy(llToVec(a.lat, a.lon, R * 0.99));
+  globe.add(mk);
+
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+}
+
+function buildGraticule(parent) {
+  const mat = new THREE.LineBasicMaterial({ color: 0x1d2c45 });
+  for (let lat = -60; lat <= 60; lat += 30) {
+    const pts = [];
+    for (let lon = -180; lon <= 180; lon += 4) pts.push(llToVec(lat, lon, R * 0.99));
+    parent.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat));
+  }
+  for (let lon = -180; lon < 180; lon += 30) {
+    const pts = [];
+    for (let lat = -90; lat <= 90; lat += 4) pts.push(llToVec(lat, lon, R * 0.99));
+    parent.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat));
+  }
+  console.log('graticule built');
+}
+
+async function loadCountries(parent) {
+  const mat = new THREE.LineBasicMaterial({ color: 0x4a7bd6 });
+  try {
+    const url = 'https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json';
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const topo = await res.json();
+    drawTopo(topo, parent, mat);
+    console.log('country boundaries loaded');
+  } catch (e) {
+    console.warn('country data unavailable (' + (e.message||e) + ') - grid only');
+  }
+}
+
+function drawTopo(topo, parent, mat) {
+  const arcs = topo.arcs, transform = topo.transform;
+  const sx = transform.scale[0], sy = transform.scale[1];
+  const tx = transform.translate[0], ty = transform.translate[1];
+  const decoded = arcs.map(arc => {
+    let x = 0, y = 0;
+    return arc.map(d => { x += d[0]; y += d[1]; return [x * sx + tx, y * sy + ty]; });
+  });
+  const obj = topo.objects.countries;
+  for (const geom of obj.geometries) {
+    const polys = geom.type === 'Polygon' ? [geom.arcs] : geom.arcs;
+    for (const poly of polys) {
+      for (const ring of poly) {
+        const pts = [];
+        for (let ai of ring) {
+          const rev = ai < 0; if (rev) ai = ~ai;
+          const seg = decoded[ai];
+          const ordered = rev ? seg.slice().reverse() : seg;
+          for (const p of ordered) pts.push(llToVec(p[1], p[0], R * 0.992));
+        }
+        if (pts.length > 1)
+          parent.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat));
+      }
+    }
+  }
+}
+
+function deviceQuaternion() {
+  const q = new THREE.Quaternion();
+  const e = new THREE.Euler(oBeta, oAlpha, -oGamma, 'YXZ');
+  q.setFromEuler(e);
+  q.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), -Math.PI/2));
+  if (screenAngle) q.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,0,1), -screenAngle));
+  return q;
+}
+
+function enableDragFallback() {
+  if (dragMode) return;
+  dragMode = true;
+  let px, py, down = false;
+  const c = $('scene');
+  c.addEventListener('pointerdown', e => { down = true; px = e.clientX; py = e.clientY; });
+  c.addEventListener('pointermove', e => {
+    if (!down) return;
+    dragYaw   -= (e.clientX - px) * 0.005;
+    dragPitch -= (e.clientY - py) * 0.005;
+    dragPitch = Math.max(-1.55, Math.min(1.55, dragPitch));
+    px = e.clientX; py = e.clientY;
+  });
+  c.addEventListener('pointerup', () => down = false);
+  c.addEventListener('pointercancel', () => down = false);
+}
+
+function lookDirection() {
+  if (dragMode) {
+    return new THREE.Vector3(
+      Math.cos(dragPitch) * Math.sin(dragYaw),
+      Math.sin(dragPitch),
+      Math.cos(dragPitch) * Math.cos(dragYaw)
+    );
+  }
+  return new THREE.Vector3(0, 0, -1).applyQuaternion(deviceQuaternion());
+}
+
+function loop() {
+  requestAnimationFrame(loop);
+
+  const up = llToVec(userLat, userLon, R).normalize();
+  const q = new THREE.Quaternion().setFromUnitVectors(up, new THREE.Vector3(0, 1, 0));
+  globe.quaternion.copy(q);
+
+  const dir = lookDirection().normalize();
+  const eye = new THREE.Vector3(0, R + 0.001, 0);
+  camera.position.copy(eye);
+  camera.lookAt(eye.clone().add(dir));
+
+  const downAmount = -dir.y;
+  $('depth').textContent =
+    downAmount > 0.85 ? 'core / antipode' :
+    downAmount > 0.4  ? 'deep mantle' :
+    downAmount > 0.05 ? 'crust' : 'sky';
+
+  const heading = ((Math.atan2(dir.x, dir.z) * R2D) + 360) % 360;
+  const pitch = Math.asin(Math.max(-1, Math.min(1, dir.y))) * R2D;
+  $('orient').textContent =
+    heading.toFixed(0) + '\u00b0 \u00b7 ' + pitch.toFixed(0) + '\u00b0' +
+    (dragMode ? ' (drag)' : '');
+
+  const a = antipode(userLat, userLon);
+  $('target').textContent = downAmount > 0.6 ? fmt(a.lat, a.lon) : '- (aim down)';
+
+  renderer.render(scene, camera);
+}
+</script>
+</body>
+</html>
