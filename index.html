@@ -45,6 +45,14 @@
   .reticle::before { left: 50%; top: -10px; bottom: -10px; width: 1px; margin-left: -0.5px; }
   .reticle::after { top: 50%; left: -10px; right: -10px; height: 1px; margin-top: -0.5px; }
 
+  #reticleLabel {
+    position: fixed; top: 50%; left: 50%; transform: translate(-50%, 34px);
+    z-index: 9; pointer-events: none; text-align: center;
+    font-size: 13px; letter-spacing: 0.05em; color: var(--core);
+    text-shadow: 0 0 8px rgba(0,0,0,0.9), 0 0 2px rgba(0,0,0,1);
+    min-height: 16px; max-width: 70vw;
+  }
+
   .gate {
     position: fixed; inset: 0; z-index: 50;
     background: radial-gradient(120% 80% at 50% 30%, #0b1020 0%, #05070d 70%);
@@ -91,6 +99,7 @@
   <div class="corner tr"><div>looking at</div><div class="val accent" id="target">—</div></div>
   <div class="corner bl"><div>heading · pitch</div><div class="val" id="orient">—</div></div>
   <div class="corner br"><div>depth</div><div class="val" id="depth">surface</div></div>
+  <div id="reticleLabel"></div>
 </div>
 
 <div class="gate" id="gate">
@@ -138,6 +147,68 @@
   console.log('console ready');
 })();
 
+/* ============================================================================
+ * ANTIPODE — "see through the ground" earth viewer
+ * ----------------------------------------------------------------------------
+ * Concept: the camera sits on Earth's surface and looks DOWN THROUGH the planet
+ * to see the far side, with a live day/night terminator. Think Google Sky Map,
+ * but pointed at the ground.
+ *
+ * ARCHITECTURE & THE NON-OBVIOUS DECISIONS (these took many iterations — change
+ * with care):
+ *
+ * 1. SEE-THROUGH VIA BACK-FACE CULLING (not transparency).
+ *    Everything is OPAQUE and rendered side: THREE.BackSide. The eye is exactly
+ *    at radius R (on the surface), so the near hemisphere's faces point at the
+ *    eye (front faces) and are culled — we see straight through to the inner far
+ *    wall. Because it's opaque with normal depth testing, overlapping triangles
+ *    from imperfect polygon triangulation just paint the same surface twice and
+ *    the overdraw is INVISIBLE. (Earlier transparent versions double-blended
+ *    overlaps and showed ugly dark artifacts.) This is why we don't need a
+ *    perfect triangulation.
+ *
+ * 2. DEPTH ORDERING. Country fills are at exactly R (the surface), so the eye
+ *    (also at R) stands ON the ground. The dark shell is ALSO at exactly R — a
+ *    point on a sphere sees the rest of the sphere at or below its tangent plane,
+ *    so a shell at R never pokes above the horizon (y=R). To stop the shell and
+ *    fills (both at R) from z-fighting, the shell uses polygonOffset to render as
+ *    if slightly farther, so the fills win on the far side. Boundary/grid/horizon
+ *    lines all use depthTest:false + renderOrder so they always overlay on top.
+ *    Do NOT shrink the fills/lines groups to sort them — an earlier version
+ *    scaled them to 0.992*R, which dropped the ground ~51 km below the eye and
+ *    looked like viewing from altitude.
+ *
+ * 3. SPHERICAL TRIANGULATION VIA GNOMONIC PROJECTION (sphericalPolygonGeometry).
+ *    Country polygons are projected gnomonically onto a tangent plane at each
+ *    polygon's own centroid (where great circles become straight lines), ear-
+ *    clipped with THREE.ShapeUtils.triangulateShape, then mapped back to the
+ *    sphere. Converting to 3D vectors BEFORE projecting makes the antimeridian
+ *    (±180°) a non-issue (no lon discontinuity). bandedSphericalGeometry is the
+ *    fallback for polygons too big for one gnomonic chart (e.g. Antarctica).
+ *
+ * 4. DAY/NIGHT IN A CUSTOM SHADER (not a directional light). Back-face rendering
+ *    would invert normal-based lighting, so instead the fill shader computes a
+ *    day factor = dot(surface point, live sun direction). subsolarPoint() gives
+ *    the real sun position from the device clock; the loop rotates that sun
+ *    vector by the same globe quaternion as the geometry so lighting stays locked
+ *    to geography. (Longitude uses a simple -15°/hr model; no equation-of-time,
+ *    so the terminator can be off by up to ~±4° E/W. Declination is accurate.)
+ *    NOTE: the shader reimplements FogExp2 manually (uFogDensity must match
+ *    scene.fog density if you retune it — two separate knobs).
+ *
+ * 5. CAMERA at exactly (0, R, 0). The globe is rotated each frame so the user's
+ *    lat/lon lands at world +Y, i.e. under the camera. dragPitch=0 looks at the
+ *    horizon; negative pitches down through the planet. The horizon ring lives in
+ *    the y=R plane (eye level) — if you move the eye height, move the horizon too.
+ *
+ * 6. SENSORS: needs a top-level HTTPS page (not a sandboxed iframe) for device
+ *    orientation. A 2.5s watchdog falls back to drag-to-look if no events arrive.
+ *    The on-screen console (bottom-right) is the phone-friendly debugger.
+ *
+ * Data: world-atlas TopoJSON (countries-110m) from CDN. Names bundled in
+ * ISO_NAMES so labels don't depend on a second fetch.
+ * ==========================================================================*/
+
 /* ---------------- guard: did Three.js load? ---------------- */
 if (typeof THREE === 'undefined') {
   console.error('THREE failed to load - the CDN script was blocked. The 3D view cannot run here.');
@@ -146,15 +217,23 @@ if (typeof THREE === 'undefined') {
 const $ = id => document.getElementById(id);
 const D2R = Math.PI / 180, R2D = 180 / Math.PI;
 
-let userLat = 0, userLon = 0, haveLoc = false;
-let renderer, scene, camera, globe, boundaries;
-const R = 1;
+let userLat = 0, userLon = 0, haveLoc = false;   // observer position; haveLoc=false => using preset coords
+let renderer, scene, camera, globe, boundaries, fills; // globe = group holding shell+fills+lines, rotated each frame
+let raycaster, hoverName = '';                   // raycaster labels the country under the center reticle
+const R = 1;                                     // Earth radius in scene units; eye sits at exactly this
+
+// shared uniform object so every country fill reads the same live sun direction
+const sunUniforms = { uSunDir: { value: new THREE.Vector3(1, 0, 0) } };
 
 let oAlpha = 0, oBeta = 0, oGamma = 0;
 let screenAngle = 0;
 let gotOrientation = false;
 let dragMode = false;
-let dragYaw = 0, dragPitch = -1.2;
+// dragPitch starts at 0 = looking straight at the horizon. Negative pitch aims
+// down THROUGH the planet toward the far side (the core/antipode); positive
+// aims up at the sky. Starting at the horizon avoids the "looking down from
+// height" feel that a steep initial pitch produced.
+let dragYaw = 0, dragPitch = 0;
 
 $('start').addEventListener('click', () => { begin().catch(showFatal); });
 
@@ -164,6 +243,9 @@ function showFatal(e) {
   $('err').textContent = 'Could not start: ' + (e && e.message ? e.message : e);
 }
 
+// Startup: acquire location (with fallback), request motion permission, build
+// the scene, then start the render loop. Called from the Begin button so the
+// iOS motion-permission prompt happens inside a user gesture.
 async function begin() {
   $('err').textContent = '';
   $('spin').classList.remove('hide');
@@ -249,6 +331,8 @@ async function begin() {
   console.log('render loop running');
 }
 
+// Device orientation handler: store raw alpha/beta/gamma (radians). The first
+// event flips gotOrientation so the sensor watchdog knows data is flowing.
 function onOrient(e) {
   if (e.alpha == null && e.beta == null && e.gamma == null) return;
   if (!gotOrientation) { gotOrientation = true; console.log('first orientation event received'); }
@@ -270,6 +354,36 @@ function llToVec(lat, lon, r) {
   );
 }
 
+// Subsolar point: the lat/lon where the sun is directly overhead at a given
+// time. Uses a standard low-precision solar-position approximation (good to
+// well under a degree — plenty for a day/night terminator).
+function subsolarPoint(date) {
+  const rad = Math.PI / 180;
+  // days since J2000.0
+  const jd = date.getTime() / 86400000 + 2440587.5;
+  const n = jd - 2451545.0;
+  const L = (280.460 + 0.9856474 * n) % 360;            // mean longitude
+  const g = ((357.528 + 0.9856003 * n) % 360) * rad;    // mean anomaly
+  const lambda = (L + 1.915 * Math.sin(g) + 0.020 * Math.sin(2 * g)) * rad; // ecliptic long
+  const epsilon = 23.439 * rad;                          // obliquity
+  // solar declination
+  const decl = Math.asin(Math.sin(epsilon) * Math.sin(lambda)) / rad;
+  // Greenwich hour angle -> subsolar longitude. The sun is overhead at local
+  // solar noon; at UTC noon it's near 0° longitude, moving -15°/hour.
+  const utcHours = date.getUTCHours() + date.getUTCMinutes() / 60 + date.getUTCSeconds() / 3600;
+  let lon = -15 * (utcHours - 12);
+  while (lon > 180) lon -= 360;
+  while (lon < -180) lon += 360;
+  return { lat: decl, lon: lon };
+}
+
+// update the shared sun-direction uniform from the current clock
+function updateSunDirection() {
+  const sp = subsolarPoint(new Date());
+  sunUniforms.uSunDir.value.copy(llToVec(sp.lat, sp.lon, 1).normalize());
+  return sp;
+}
+
 function initScene() {
   renderer = new THREE.WebGLRenderer({ canvas: $('scene'), antialias: true, alpha: true });
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -277,43 +391,86 @@ function initScene() {
 
   scene = new THREE.Scene();
   scene.fog = new THREE.FogExp2(0x05070d, 0.42);
+  // lights so the country fills get real shading across the curved surface
+  scene.add(new THREE.AmbientLight(0x404a5c, 1.0));
+  const keyLight = new THREE.DirectionalLight(0xfff0e0, 1.1);
+  keyLight.position.set(1.5, 2, 1);
+  scene.add(keyLight);
+  const rimLight = new THREE.DirectionalLight(0xff8a4d, 0.5);
+  rimLight.position.set(-1, -1.5, -1);
+  scene.add(rimLight);
   camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.01, 100);
 
   globe = new THREE.Group();
   scene.add(globe);
 
-  // Earth body as a translucent shell. Render only the FAR (back) faces and
-  // skip depth-writing, so the near hemisphere never occludes the far-side
-  // boundary lines we want to "see through the ground" toward. The fog then
-  // dims geography by how deep through the planet it sits.
+  // OPAQUE see-through model: the eye sits exactly at the surface (radius R)
+  // looking inward, so nothing is ever between the eye and the far inner wall.
+  // We render only BACK faces (cull front), which means near-side geometry —
+  // whose faces point up at the eye — is culled, and we see straight through to
+  // the far hemisphere. Drawing opaque with normal depth testing means
+  // overlapping triangles just paint the same surface twice (no double-blend),
+  // so triangulation overdraw becomes invisible. Fog blends color by depth
+  // through the planet, giving the "x-ray falloff" without transparency.
+  // Dark ocean/earth shell at EXACTLY R — same radius as the fills and the eye,
+  // so it never pokes above the horizon plane (y=R). To avoid z-fighting with
+  // the fills (also at R), the shell is pushed BACK in the depth buffer via
+  // polygonOffset rather than by enlarging its radius. Positive offset = treated
+  // as farther away, so on the far side the country fills win and draw in front.
+  // Back-face only + opaque, as above.
   globe.add(new THREE.Mesh(
-    new THREE.SphereGeometry(R * 0.985, 64, 48),
+    new THREE.SphereGeometry(R, 64, 48),
     new THREE.MeshBasicMaterial({
-      color: 0x0a1424, transparent: true, opacity: 0.22,
-      side: THREE.BackSide, depthWrite: false
+      color: 0x0a1424, side: THREE.BackSide, fog: true,
+      polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1
     })
   ));
-  // molten core glow, also non-occluding
-  globe.add(new THREE.Mesh(
-    new THREE.SphereGeometry(R * 0.5, 32, 24),
-    new THREE.MeshBasicMaterial({
-      color: 0xff7a3d, transparent: true, opacity: 0.18,
-      side: THREE.BackSide, depthWrite: false
-    })
-  ));
-  // faint atmospheric halo
+  // faint atmospheric halo (stays subtle; transparent is fine here since it's
+  // a single non-overlapping shell)
   globe.add(new THREE.Mesh(
     new THREE.SphereGeometry(R * 1.06, 48, 32),
     new THREE.MeshBasicMaterial({
       color: 0x2a3f63, transparent: true, opacity: 0.08,
-      side: THREE.BackSide, depthWrite: false
+      side: THREE.BackSide, depthWrite: false, fog: true
     })
   ));
 
   boundaries = new THREE.Group();
+  fills = new THREE.Group();
+  // Fills and lines live at exactly radius R — the true surface — so the eye
+  // (also at R) stands ON the ground rather than above it. Depth ordering is
+  // handled by pushing the SHELL slightly outward (see below) and by drawing
+  // lines with depthTest:false, NOT by shrinking these groups. (Shrinking them
+  // previously put the ground ~51 km below the eye, which looked like altitude.)
+  globe.add(fills);
   globe.add(boundaries);
   buildGraticule(boundaries);
-  loadCountries(boundaries);
+  loadCountries(boundaries, fills);
+
+  raycaster = new THREE.Raycaster();
+  const sp0 = updateSunDirection();
+  console.log('subsolar point:', sp0.lat.toFixed(1) + '°, ' + sp0.lon.toFixed(1) + '°');
+
+  // Horizon = eye-level line: the directions perpendicular to "up". The user's
+  // up is world +Y and the eye is at (0,R,0), so this is a big ring in the
+  // y = R plane centered on the eye. At large radius it projects to a straight
+  // horizontal line through the pitch=0 vanishing point, banking correctly with
+  // device roll. Kept in world space so it's independent of the spinning globe.
+  const HR = 50; // large radius -> reads as a straight line at infinity
+  const horizonPts = [];
+  for (let i = 0; i <= 160; i++) {
+    const t = (i / 160) * Math.PI * 2;
+    horizonPts.push(new THREE.Vector3(Math.cos(t) * HR, R, Math.sin(t) * HR));
+  }
+  const horizon = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(horizonPts),
+    new THREE.LineBasicMaterial({
+      color: 0xff7a3d, transparent: true, opacity: 0.6, fog: false,
+      depthTest: false, depthWrite: false
+    })
+  );
+  horizon.renderOrder = 12; // above fills, grid, and country borders
+  scene.add(horizon);
 
   const a = antipode(userLat, userLon);
   const mk = new THREE.Mesh(
@@ -330,36 +487,92 @@ function initScene() {
   });
 }
 
+// Lat/lon reference grid (every 30°). Additive, depthTest:false so it floats on
+// top as an overlay (see header note 2 on line rendering).
 function buildGraticule(parent) {
-  const mat = new THREE.LineBasicMaterial({ color: 0x1d2c45 });
+  const mat = new THREE.LineBasicMaterial({
+    color: 0xffffff, transparent: true, opacity: 0.16,
+    blending: THREE.AdditiveBlending, depthTest: false, depthWrite: false, fog: false
+  });
+  const lines = [];
   for (let lat = -60; lat <= 60; lat += 30) {
     const pts = [];
-    for (let lon = -180; lon <= 180; lon += 4) pts.push(llToVec(lat, lon, R * 0.99));
-    parent.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat));
+    for (let lon = -180; lon <= 180; lon += 4) pts.push(llToVec(lat, lon, R));
+    lines.push(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat));
   }
   for (let lon = -180; lon < 180; lon += 30) {
     const pts = [];
-    for (let lat = -90; lat <= 90; lat += 4) pts.push(llToVec(lat, lon, R * 0.99));
-    parent.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat));
+    for (let lat = -90; lat <= 90; lat += 4) pts.push(llToVec(lat, lon, R));
+    lines.push(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat));
   }
+  for (const ln of lines) { ln.renderOrder = 10; parent.add(ln); }
   console.log('graticule built');
 }
 
-async function loadCountries(parent) {
-  const mat = new THREE.LineBasicMaterial({ color: 0x4a7bd6 });
+// ISO 3166-1 numeric -> country name, matching world-atlas geometry ids.
+// Bundled so labels never depend on an optional names fetch.
+const ISO_NAMES = {
+"004":"Afghanistan","024":"Angola","008":"Albania","784":"United Arab Emirates","032":"Argentina",
+"051":"Armenia","010":"Antarctica","260":"Fr. S. Antarctic Lands","036":"Australia","040":"Austria",
+"031":"Azerbaijan","108":"Burundi","056":"Belgium","204":"Benin","854":"Burkina Faso","050":"Bangladesh",
+"100":"Bulgaria","044":"Bahamas","070":"Bosnia and Herz.","112":"Belarus","084":"Belize","068":"Bolivia",
+"076":"Brazil","064":"Bhutan","072":"Botswana","140":"Central African Rep.","124":"Canada","756":"Switzerland",
+"152":"Chile","156":"China","384":"Côte d'Ivoire","120":"Cameroon","180":"Dem. Rep. Congo","178":"Congo",
+"170":"Colombia","188":"Costa Rica","192":"Cuba","196":"Cyprus","203":"Czechia","276":"Germany","262":"Djibouti",
+"208":"Denmark","214":"Dominican Rep.","012":"Algeria","218":"Ecuador","818":"Egypt","232":"Eritrea","724":"Spain",
+"233":"Estonia","231":"Ethiopia","246":"Finland","242":"Fiji","250":"France","266":"Gabon","826":"United Kingdom",
+"268":"Georgia","288":"Ghana","324":"Guinea","270":"Gambia","624":"Guinea-Bissau","226":"Eq. Guinea","300":"Greece",
+"304":"Greenland","320":"Guatemala","328":"Guyana","340":"Honduras","191":"Croatia","332":"Haiti","348":"Hungary",
+"360":"Indonesia","356":"India","372":"Ireland","364":"Iran","368":"Iraq","352":"Iceland","376":"Israel","380":"Italy",
+"388":"Jamaica","400":"Jordan","392":"Japan","398":"Kazakhstan","404":"Kenya","417":"Kyrgyzstan","116":"Cambodia",
+"410":"South Korea","383":"Kosovo","414":"Kuwait","418":"Laos","422":"Lebanon","430":"Liberia","434":"Libya",
+"144":"Sri Lanka","426":"Lesotho","440":"Lithuania","442":"Luxembourg","428":"Latvia","504":"Morocco","498":"Moldova",
+"450":"Madagascar","484":"Mexico","807":"North Macedonia","466":"Mali","104":"Myanmar","499":"Montenegro",
+"496":"Mongolia","508":"Mozambique","478":"Mauritania","454":"Malawi","458":"Malaysia","516":"Namibia","562":"Niger",
+"566":"Nigeria","558":"Nicaragua","528":"Netherlands","578":"Norway","524":"Nepal","554":"New Zealand","512":"Oman",
+"586":"Pakistan","591":"Panama","604":"Peru","608":"Philippines","598":"Papua New Guinea","616":"Poland",
+"408":"North Korea","620":"Portugal","600":"Paraguay","275":"Palestine","634":"Qatar","642":"Romania","643":"Russia",
+"646":"Rwanda","732":"W. Sahara","682":"Saudi Arabia","729":"Sudan","728":"S. Sudan","686":"Senegal",
+"090":"Solomon Is.","694":"Sierra Leone","222":"El Salvador","706":"Somalia","688":"Serbia","740":"Suriname",
+"703":"Slovakia","705":"Slovenia","752":"Sweden","748":"Eswatini","760":"Syria","148":"Chad","768":"Togo",
+"764":"Thailand","762":"Tajikistan","795":"Turkmenistan","626":"Timor-Leste","780":"Trinidad and Tobago",
+"788":"Tunisia","792":"Turkey","834":"Tanzania","800":"Uganda","804":"Ukraine","858":"Uruguay","840":"United States",
+"860":"Uzbekistan","862":"Venezuela","704":"Vietnam","548":"Vanuatu","887":"Yemen","710":"South Africa",
+"894":"Zambia","716":"Zimbabwe"
+};
+
+async function loadCountries(lineParent, fillParent) {
+  const lineMat = new THREE.LineBasicMaterial({
+    color: 0xffffff, transparent: true, opacity: 0.45,
+    blending: THREE.AdditiveBlending, depthTest: false, depthWrite: false, fog: false
+  });
   try {
-    const url = 'https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json';
-    const res = await fetch(url);
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const topo = await res.json();
-    drawTopo(topo, parent, mat);
-    console.log('country boundaries loaded');
+    const topoRes = await fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json');
+    if (!topoRes.ok) throw new Error('HTTP ' + topoRes.status);
+    const topo = await topoRes.json();
+    drawTopo(topo, lineParent, fillParent, lineMat);
+    console.log('country boundaries + fills loaded');
   } catch (e) {
     console.warn('country data unavailable (' + (e.message||e) + ') - grid only');
   }
 }
 
-function drawTopo(topo, parent, mat) {
+// decode a TopoJSON ring to an array of [lon,lat]
+function decodeRing(ring, decoded) {
+  const out = [];
+  for (let ai of ring) {
+    const rev = ai < 0; if (rev) ai = ~ai;
+    const seg = decoded[ai];
+    const ordered = rev ? seg.slice().reverse() : seg;
+    for (const p of ordered) out.push(p);
+  }
+  return out;
+}
+
+// Decode the TopoJSON country layer into per-country filled meshes (one shaded
+// ShaderMaterial each, colored by a hash of the name) plus boundary lines.
+// Holes (ring[1..] within a polygon) are passed through to the triangulator.
+function drawTopo(topo, lineParent, fillParent, lineMat) {
   const arcs = topo.arcs, transform = topo.transform;
   const sx = transform.scale[0], sy = transform.scale[1];
   const tx = transform.translate[0], ty = transform.translate[1];
@@ -367,25 +580,289 @@ function drawTopo(topo, parent, mat) {
     let x = 0, y = 0;
     return arc.map(d => { x += d[0]; y += d[1]; return [x * sx + tx, y * sy + ty]; });
   });
-  const obj = topo.objects.countries;
-  for (const geom of obj.geometries) {
+
+  // Fills use a custom shader so day/night is computed from each point's
+  // position relative to the live sun direction — independent of which face we
+  // view (back-face rendering would otherwise invert normal-based lighting).
+  // Opaque, depth-tested: overlapping triangles paint identically so triangulation
+  // overdraw stays invisible. Fog still applies via the standard fog uniforms.
+  const fillVert = `
+    varying float vSun;       // -1..1: how much this point faces the sun
+    varying float vFogDepth;
+    uniform vec3 uSunDir;
+    void main() {
+      vec3 worldDir = normalize((modelMatrix * vec4(position, 1.0)).xyz);
+      vSun = dot(worldDir, uSunDir);
+      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      vFogDepth = -mv.z;
+      gl_Position = projectionMatrix * mv;
+    }`;
+  const fillFrag = `
+    varying float vSun;
+    varying float vFogDepth;
+    uniform vec3 uColor;
+    uniform vec3 uFogColor;
+    uniform float uFogDensity;
+    void main() {
+      // smooth terminator: full day at vSun>0.1, full night below -0.1
+      float day = smoothstep(-0.1, 0.1, vSun);
+      // night side keeps a dim ambient so it's not pure black
+      vec3 lit = uColor * mix(0.18, 1.0, day);
+      // exp2 fog toward background by depth through the planet
+      float f = 1.0 - exp(-uFogDensity * uFogDensity * vFogDepth * vFogDepth);
+      vec3 col = mix(lit, uFogColor, clamp(f, 0.0, 1.0));
+      gl_FragColor = vec4(col, 1.0);
+    }`;
+
+  const makeFillMaterial = (hue) => new THREE.ShaderMaterial({
+    side: THREE.BackSide,
+    uniforms: {
+      uSunDir: sunUniforms.uSunDir,
+      uColor: { value: new THREE.Color().setHSL(hue, 0.55, 0.5) },
+      uFogColor: { value: new THREE.Color(0x05070d) },
+      uFogDensity: { value: 0.42 }
+    },
+    vertexShader: fillVert,
+    fragmentShader: fillFrag
+  });
+
+  for (const geom of topo.objects.countries.geometries) {
+    const idKey = geom.id != null ? String(geom.id).padStart(3, '0') : null;
+    const name = (idKey && ISO_NAMES[idKey]) || ('region ' + (geom.id != null ? geom.id : '?'));
     const polys = geom.type === 'Polygon' ? [geom.arcs] : geom.arcs;
+
     for (const poly of polys) {
-      for (const ring of poly) {
-        const pts = [];
-        for (let ai of ring) {
-          const rev = ai < 0; if (rev) ai = ~ai;
-          const seg = decoded[ai];
-          const ordered = rev ? seg.slice().reverse() : seg;
-          for (const p of ordered) pts.push(llToVec(p[1], p[0], R * 0.992));
+      // TopoJSON/GeoJSON: within one polygon, ring[0] is the exterior, ring[1..]
+      // are interior holes. We triangulate via a gnomonic projection centered on
+      // the polygon, which makes great-circle arcs straight — so ear-clipping
+      // there yields geodesic triangles that hug the sphere, with no pole or
+      // antimeridian distortion. No special-casing needed.
+      const outer = decodeRing(poly[0], decoded);
+      if (outer.length < 3) continue;
+      const holes = [];
+      for (let h = 1; h < poly.length; h++) {
+        const hr = decodeRing(poly[h], decoded);
+        if (hr.length >= 3) holes.push(hr);
+      }
+
+      const linePts = outer.map(p => llToVec(p[1], p[0], R));
+      if (linePts.length > 1) {
+        const ln = new THREE.Line(new THREE.BufferGeometry().setFromPoints(linePts), lineMat);
+        ln.renderOrder = 11; // above fills and graticule
+        lineParent.add(ln);
+      }
+      for (const hole of holes) {
+        const hp = hole.map(p => llToVec(p[1], p[0], R));
+        if (hp.length > 1) {
+          const ln = new THREE.Line(new THREE.BufferGeometry().setFromPoints(hp), lineMat);
+          ln.renderOrder = 11;
+          lineParent.add(ln);
         }
-        if (pts.length > 1)
-          parent.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat));
+      }
+
+      const geo = sphericalPolygonGeometry(outer, holes);
+      if (geo) {
+        const hue = (hashStr(name) % 360) / 360;
+        const m = new THREE.Mesh(geo, makeFillMaterial(hue));
+        m.userData.name = name;
+        fillParent.add(m);
       }
     }
   }
 }
 
+// simple deterministic hash so each country gets a stable distinct hue
+function hashStr(s) { let h = 0; for (let i=0;i<s.length;i++) h = (h*31 + s.charCodeAt(i)) & 0xffff; return h; }
+
+// Does a [lon,lat] ring cross the ±180° antimeridian? Detected by any
+// consecutive longitude jump greater than 180°.
+// Clip a [lon,lat] ring to the longitude slab [lonMin, lonMax] via
+// Sutherland–Hodgman (two half-plane clips on the lon axis).
+function clipRingToLonBand(ring, lonMin, lonMax) {
+  const clipEdge = (pts, keep) => {
+    const out = [];
+    for (let i = 0; i < pts.length; i++) {
+      const cur = pts[i], prev = pts[(i + pts.length - 1) % pts.length];
+      const curIn = keep(cur[0]), prevIn = keep(prev[0]);
+      if (curIn) {
+        if (!prevIn) out.push(lerpLon(prev, cur, keep));
+        out.push(cur);
+      } else if (prevIn) {
+        out.push(lerpLon(prev, cur, keep));
+      }
+    }
+    return out;
+  };
+  // intersect a segment with the lon boundary, interpolating lat
+  const lerpLon = (a, b, keep) => {
+    const bound = keep(lonMin) && !keep(lonMax) ? lonMin
+                : (!keep(lonMin) && keep(lonMax) ? lonMax
+                : (Math.abs(a[0]-lonMin)<Math.abs(a[0]-lonMax)?lonMin:lonMax));
+    const t = (bound - a[0]) / ((b[0] - a[0]) || 1e-9);
+    return [bound, a[1] + t * (b[1] - a[1])];
+  };
+  let r = clipEdge(ring, lon => lon >= lonMin);
+  if (r.length < 3) return [];
+  r = clipEdge(r, lon => lon <= lonMax);
+  return r.length >= 3 ? r : [];
+}
+
+// For polygons too wide for one gnomonic chart: clip into longitude bands,
+// triangulate each band's piece on its own chart, and merge the results.
+function bandedSphericalGeometry(outerLL, holesLL) {
+  let lonMin = Infinity, lonMax = -Infinity;
+  for (const p of outerLL) { if (p[0] < lonMin) lonMin = p[0]; if (p[0] > lonMax) lonMax = p[0]; }
+  const BAND = 40; // degrees
+  const merged = [];
+  for (let lo = lonMin; lo < lonMax; lo += BAND) {
+    const hi = Math.min(lo + BAND, lonMax);
+    const piece = clipRingToLonBand(outerLL, lo, hi);
+    if (piece.length < 3) continue;
+    // holes clipped to the same band
+    const pieceHoles = holesLL.map(h => clipRingToLonBand(h, lo, hi)).filter(h => h.length >= 3);
+    const geo = sphericalPolygonGeometry(piece, pieceHoles, true);
+    if (geo) {
+      const pos = geo.getAttribute('position');
+      for (let i = 0; i < pos.count; i++) merged.push(pos.getX(i), pos.getY(i), pos.getZ(i));
+    }
+  }
+  if (!merged.length) return null;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(merged, 3));
+  g.computeVertexNormals();
+  return g;
+}
+
+// signed area of a 2D ring (positive = CCW)
+function ringArea2D(pts) {
+  let a = 0;
+  for (let i = 0, n = pts.length, j = n - 1; i < n; j = i++) {
+    a += (pts[j].x * pts[i].y) - (pts[i].x * pts[j].y);
+  }
+  return a / 2;
+}
+
+// Triangulate a spherical polygon by projecting it gnomonically onto the
+// tangent plane at the polygon's centroid, ear-clipping there, then mapping
+// vertices back to the sphere. In a gnomonic projection every great circle is
+// a straight line, so triangle edges become geodesics that hug the surface —
+// this removes the pole distortion and antimeridian spanning that a flat
+// lon/lat triangulation produces. Each polygon uses its OWN center, so there
+// is no global seam.
+function sphericalPolygonGeometry(outer, holes, noBand) {
+  const clean = (ring) => {
+    const pts = ring.slice();
+    if (pts.length > 1) {
+      const a = pts[0], b = pts[pts.length - 1];
+      if (a[0] === b[0] && a[1] === b[1]) pts.pop();
+    }
+    // drop near-duplicate consecutive vertices — ear-clipping turns these into
+    // zero-area slivers that read as overlapping triangles
+    const out = [];
+    const EPS = 1e-7;
+    for (let i = 0; i < pts.length; i++) {
+      const cur = pts[i], prev = pts[(i + pts.length - 1) % pts.length];
+      if (Math.abs(cur[0] - prev[0]) > EPS || Math.abs(cur[1] - prev[1]) > EPS) out.push(cur);
+    }
+    return out;
+  };
+
+  const outerLL = clean(outer);
+  if (outerLL.length < 3) return null;
+  const holesLL = (holes || []).map(clean).filter(h => h.length >= 3);
+
+  // 3D unit vectors for every vertex
+  const toVec = (p) => llToVec(p[1], p[0], 1).normalize();
+  const outerV = outerLL.map(toVec);
+  const holesV = holesLL.map(h => h.map(toVec));
+
+  // projection center = normalized average of the outer ring's 3D points
+  const center = new THREE.Vector3();
+  for (const v of outerV) center.add(v);
+  if (center.lengthSq() < 1e-9) return null; // ring wraps a full great circle; skip
+  center.normalize();
+
+  // build a tangent basis (east, north) at the center
+  const up = new THREE.Vector3(0, 1, 0);
+  let east = new THREE.Vector3().crossVectors(up, center);
+  if (east.lengthSq() < 1e-9) east = new THREE.Vector3(1, 0, 0); // center at a pole
+  east.normalize();
+  const north = new THREE.Vector3().crossVectors(center, east).normalize();
+
+  // gnomonic projection: project v onto the plane tangent at center.
+  // valid only for the hemisphere facing center (v·center > 0).
+  const project = (v) => {
+    const d = v.dot(center);
+    if (d <= 1e-4) return null; // point on far side / at 90°+, can't project
+    const s = 1 / d;
+    return new THREE.Vector2(v.clone().multiplyScalar(s).dot(east),
+                             v.clone().multiplyScalar(s).dot(north));
+  };
+
+  const projectRing = (ring) => {
+    const out = [];
+    for (const v of ring) {
+      const p = project(v);
+      if (!p) return null; // any unprojectable point => polygon too large for one gnomonic chart
+      out.push(p);
+    }
+    return out;
+  };
+
+  const contour = projectRing(outerV);
+  if (!contour || contour.length < 3) {
+    // Polygon too large for a single gnomonic chart (e.g. Russia, Antarctica).
+    // Fall back to clipping it into ~40°-wide longitude bands and triangulating
+    // each band on its own chart, so the whole country still renders. The
+    // noBand guard stops a degenerate band from recursing forever.
+    if (noBand) return null;
+    return bandedSphericalGeometry(outerLL, holesLL);
+  }
+  const holeContours = [];
+  for (const hv of holesV) {
+    const hc = projectRing(hv);
+    if (hc && hc.length >= 3) holeContours.push(hc);
+  }
+
+  // winding: contour CCW, holes CW (what triangulateShape expects)
+  const forceWinding = (pts, wantCCW) =>
+    (ringArea2D(pts) > 0) === wantCCW ? pts : pts.slice().reverse();
+  const c2 = forceWinding(contour, true);
+  const h2 = holeContours.map(h => forceWinding(h, false));
+
+  let faces;
+  try { faces = THREE.ShapeUtils.triangulateShape(c2, h2); }
+  catch (e) { return null; }
+  if (!faces || !faces.length) return null;
+
+  // map each 2D projected point back to a 3D sphere point:
+  // unproject p -> direction (center + p.x*east + p.y*north), normalize, *R
+  const flat2D = c2.slice();
+  for (const h of h2) for (const v of h) flat2D.push(v);
+  const flat3D = flat2D.map(p => {
+    const dir = center.clone()
+      .add(east.clone().multiplyScalar(p.x))
+      .add(north.clone().multiplyScalar(p.y));
+    return dir.normalize().multiplyScalar(R);
+  });
+
+  const positions = [];
+  for (const tri of faces) {
+    for (const idx of tri) {
+      const s = flat3D[idx];
+      positions.push(s.x, s.y, s.z);
+    }
+  }
+
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  g.computeVertexNormals();
+  return g;
+}
+
+// Convert device orientation (alpha/beta/gamma) into a look quaternion,
+// accounting for the -90° tilt (phone held upright vs flat) and current screen
+// rotation. Used by lookDirection() when sensors are active.
 function deviceQuaternion() {
   const q = new THREE.Quaternion();
   const e = new THREE.Euler(oBeta, oAlpha, -oGamma, 'YXZ');
@@ -395,6 +872,8 @@ function deviceQuaternion() {
   return q;
 }
 
+// Touch/mouse fallback when motion sensors are unavailable (desktop, or sensor
+// permission blocked). Drag updates dragYaw/dragPitch, consumed by lookDirection().
 function enableDragFallback() {
   if (dragMode) return;
   dragMode = true;
@@ -412,6 +891,8 @@ function enableDragFallback() {
   c.addEventListener('pointercancel', () => down = false);
 }
 
+// Current gaze as a unit vector: from device sensors if available, otherwise
+// from the drag fallback's yaw/pitch.
 function lookDirection() {
   if (dragMode) {
     return new THREE.Vector3(
@@ -423,6 +904,10 @@ function lookDirection() {
   return new THREE.Vector3(0, 0, -1).applyQuaternion(deviceQuaternion());
 }
 
+// Per-frame: rotate the globe so the user's lat/lon sits under the camera,
+// update the live sun direction, aim the camera by gaze, refresh the HUD
+// readouts (depth, heading/pitch, antipode target), raycast the reticle to
+// label the country under the crosshair, and render.
 function loop() {
   requestAnimationFrame(loop);
 
@@ -430,8 +915,21 @@ function loop() {
   const q = new THREE.Quaternion().setFromUnitVectors(up, new THREE.Vector3(0, 1, 0));
   globe.quaternion.copy(q);
 
+  // Sun direction in geometry (pre-rotation) space, then rotated by the same
+  // globe quaternion so it lands in the world space the fill shader compares
+  // against (the shader's worldDir is post-modelMatrix). Recomputed live so the
+  // day/night terminator tracks the real clock.
+  const sp = subsolarPoint(new Date());
+  const sunLocal = llToVec(sp.lat, sp.lon, 1).normalize();
+  sunUniforms.uSunDir.value.copy(sunLocal.applyQuaternion(q));
+
+  // Current gaze direction (from device sensors or drag fallback)
   const dir = lookDirection().normalize();
-  const eye = new THREE.Vector3(0, R + 0.001, 0);
+
+  // Eye sits at exactly 1x Earth radius — on the surface. Do not offset this;
+  // the horizon ring (also at y=R) is defined to pass through this exact height,
+  // so any change here must be mirrored there or the horizon will float.
+  const eye = new THREE.Vector3(0, R, 0);
   camera.position.copy(eye);
   camera.lookAt(eye.clone().add(dir));
 
@@ -449,6 +947,22 @@ function loop() {
 
   const a = antipode(userLat, userLon);
   $('target').textContent = downAmount > 0.6 ? fmt(a.lat, a.lon) : '- (aim down)';
+
+  // Label whatever filled country sits under the center reticle. The reticle is
+  // screen-center, so we cast from NDC (0,0) along the camera. We may hit the
+  // near side first and the far side second; take the farthest hit when we're
+  // looking down through the planet so the label matches the "through" view.
+  if (raycaster && fills && fills.children.length) {
+    raycaster.setFromCamera({ x: 0, y: 0 }, camera);
+    const hits = raycaster.intersectObjects(fills.children, false);
+    if (hits.length) {
+      const pick = downAmount > 0.3 ? hits[hits.length - 1] : hits[0];
+      hoverName = pick.object.userData.name || '';
+    } else {
+      hoverName = '';
+    }
+    $('reticleLabel').textContent = hoverName;
+  }
 
   renderer.render(scene, camera);
 }
