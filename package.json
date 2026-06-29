@@ -1,0 +1,25 @@
+{
+  "name": "antipode",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "See through the ground — a transparent-globe AR viewer of Earth's far side.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "deploy": "npm run build && gh-pages -d dist"
+  },
+  "dependencies": {
+    "three": "^0.180.0",
+    "topojson-client": "^3.1.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.185.0",
+    "@types/topojson-client": "^3.1.5",
+    "gh-pages": "^6.3.0",
+    "typescript": "^5.9.3",
+    "vite": "^5.4.21",
+    "vite-plugin-pwa": "^0.21.2"
+  }
+}
