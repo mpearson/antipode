@@ -29,7 +29,7 @@ export class OrientationSensor {
   }
 
   attach(): void {
-    window.addEventListener('deviceorientation', this.onOrient, true);
+    // window.addEventListener('deviceorientation', this.onOrient, true);
     window.addEventListener('deviceorientationabsolute', this.onOrient, true);
 
     if (screen.orientation) {

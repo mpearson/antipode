@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#05070d" />
+  <title>Antipode — see through the ground</title>
+  <script type="module" crossorigin src="/antipode/assets/index-BncmBa7J.js"></script>
+  <link rel="stylesheet" crossorigin href="/antipode/assets/index-DywtHetg.css">
+<link rel="manifest" href="/antipode/manifest.webmanifest"><script id="vite-plugin-pwa:register-sw" src="/antipode/registerSW.js"></script></head>
+<body>
+  <canvas id="scene"></canvas>
+
+  <div class="reticle hide" id="reticle"></div>
+
+  <div class="hud hide" id="hud">
+    <div class="corner tl"><div>your position</div><div class="val" id="here">—</div></div>
+    <div class="corner tr"><div>looking at</div><div class="val accent" id="target">—</div></div>
+    <div class="corner bl"><div>heading · pitch</div><div class="val" id="orient">—</div></div>
+    <div class="corner br"><div>depth</div><div class="val" id="depth">surface</div></div>
+    <div id="reticleLabel"></div>
+  </div>
+
+  <div class="gate" id="gate">
+    <h1>Antipode</h1>
+    <p class="lede">Point your phone at the ground. See what's on the other side of the planet.</p>
+    <p>This app reads your location and your phone's motion sensors, then casts your gaze straight through the Earth.</p>
+    <button class="btn" id="start">Begin</button>
+    <div class="err" id="err"></div>
+    <div class="spin hide" id="spin">acquiring signal…</div>
+  </div>
+
+  <button id="logbar">console &#9662;</button>
+  <div id="log" class="hide"></div>
+
+</body>
+</html>
